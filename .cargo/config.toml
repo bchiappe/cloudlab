@@ -1,0 +1,7 @@
+[build]
+rustc-wrapper = "/opt/homebrew/bin/sccache"
+
+# Linker optimization disabled because zld was not found in standard paths.
+# To re-enable, find the absolute path to 'zld' and update below.
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=/path/to/zld"]
