@@ -9,6 +9,7 @@ pub struct VM {
     pub name: String,
     pub cpu: i32,
     pub memory_mb: i32,
+    pub disk_size_gb: i32,
     pub status: String,
     pub os_type: String,
     pub disk_volume_id: Option<String>,
@@ -44,7 +45,7 @@ pub async fn list_vms() -> Result<Vec<VM>, ServerFnError> {
             let conn = pool.get().map_err(srv_err)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT v.id, v.host_id, h.name as host_name, v.name, v.cpu, v.memory_mb, v.status, v.os_type, \
+                    "SELECT v.id, v.host_id, h.name as host_name, v.name, v.cpu, v.memory_mb, v.disk_size_gb, v.status, v.os_type, \
                      v.disk_volume_id, v.iso_volume_id, v.boot_device, v.mac_address, v.vnc_port, v.vnc_token \
                      FROM vms v \
                      LEFT JOIN hosts h ON v.host_id = h.id \
@@ -61,14 +62,15 @@ pub async fn list_vms() -> Result<Vec<VM>, ServerFnError> {
                     name: row.get::<_, String>(3).map_err(srv_err)?,
                     cpu: row.get::<_, i32>(4).map_err(srv_err)?,
                     memory_mb: row.get::<_, i32>(5).map_err(srv_err)?,
-                    status: row.get::<_, String>(6).map_err(srv_err)?,
-                    os_type: row.get::<_, String>(7).map_err(srv_err)?,
-                    disk_volume_id: row.get::<_, Option<String>>(8).map_err(srv_err)?,
-                    iso_volume_id: row.get::<_, Option<String>>(9).map_err(srv_err)?,
-                    boot_device: row.get::<_, String>(10).map_err(srv_err)?,
-                    mac_address: row.get::<_, Option<String>>(11).map_err(srv_err)?,
-                    vnc_port: row.get::<_, Option<i32>>(12).map_err(srv_err)?,
-                    vnc_token: row.get::<_, Option<String>>(13).map_err(srv_err)?,
+                    disk_size_gb: row.get::<_, i32>(6).map_err(srv_err)?,
+                    status: row.get::<_, String>(7).map_err(srv_err)?,
+                    os_type: row.get::<_, String>(8).map_err(srv_err)?,
+                    disk_volume_id: row.get::<_, Option<String>>(9).map_err(srv_err)?,
+                    iso_volume_id: row.get::<_, Option<String>>(10).map_err(srv_err)?,
+                    boot_device: row.get::<_, String>(11).map_err(srv_err)?,
+                    mac_address: row.get::<_, Option<String>>(12).map_err(srv_err)?,
+                    vnc_port: row.get::<_, Option<i32>>(13).map_err(srv_err)?,
+                    vnc_token: row.get::<_, Option<String>>(14).map_err(srv_err)?,
                 });
             }
             Ok(vms)
@@ -90,8 +92,10 @@ pub async fn create_vm(
     name: String,
     cpu: i32,
     memory_mb: i32,
+    disk_size_gb: i32,
     os_type: String,
-) -> Result<(), ServerFnError> {
+    boot_device: String,
+) -> Result<String, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
         crate::auth::require_role(crate::auth::UserRole::Operator).await?;
@@ -104,13 +108,15 @@ pub async fn create_vm(
             .await
             .map_err(|_| srv_err("Failed to extract DB pool"))?;
 
+        let id = uuid::Uuid::new_v4().to_string();
+        let id_task = id.clone();
+        
         tokio::task::spawn_blocking(move || -> Result<(), ServerFnError> {
             let conn = pool.get().map_err(srv_err)?;
-            let id = uuid::Uuid::new_v4().to_string();
             conn.execute(
-                "INSERT INTO vms (id, host_id, name, cpu, memory_mb, status, os_type) \
-                 VALUES (?, ?, ?, ?, ?, 'stopped', ?);",
-                params![id, host_id, name, cpu, memory_mb, os_type],
+                "INSERT INTO vms (id, host_id, name, cpu, memory_mb, disk_size_gb, status, os_type, boot_device) \
+                 VALUES (?, ?, ?, ?, ?, ?, 'stopped', ?, ?);",
+                params![id_task, host_id, name, cpu, memory_mb, disk_size_gb, os_type, boot_device],
             )
             .map_err(srv_err)?;
             Ok(())
@@ -118,7 +124,7 @@ pub async fn create_vm(
         .await
         .map_err(srv_err)??;
 
-        Ok(())
+        Ok(id)
     }
     #[cfg(not(feature = "ssr"))]
     { unreachable!() }
@@ -128,20 +134,29 @@ pub async fn create_vm(
 
 #[cfg(feature = "ssr")]
 fn generate_vm_xml(vm: &VM, bridge: &str, disk_path: &str, iso_path: Option<&str>) -> String {
-    let boot_dev = if vm.boot_device == "cdrom" { "cdrom" } else { "hd" };
-    let iso_xml = if let Some(path) = iso_path {
-        format!(
-            r#"<disk type='file' device='cdrom'>
-      <driver name='qemu' type='raw'/>
-      <source file='{}'/>
-      <target dev='sda' bus='sata'/>
-      <readonly/>
-    </disk>"#,
-            path
-        )
+    let (disk_boot, iso_boot) = if vm.boot_device == "cdrom" {
+        (2, 1)
+    } else {
+        (1, 2)
+    };
+
+    let source_tag = if let Some(path) = iso_path {
+        format!("<source file='{}'/>", path)
     } else {
         "".to_string()
     };
+
+    let iso_xml = format!(
+        r#"<disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      {}
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+      <boot order='{}'/>
+    </disk>"#,
+        source_tag, iso_boot
+    );
 
     let mac_xml = if let Some(mac) = &vm.mac_address {
         format!("<mac address='{}'/>", mac)
@@ -157,7 +172,6 @@ fn generate_vm_xml(vm: &VM, bridge: &str, disk_path: &str, iso_path: Option<&str
   <vcpu placement='static'>{}</vcpu>
   <os>
     <type arch='x86_64' machine='pc-q35-4.2'>hvm</type>
-    <boot dev='{}'/>
   </os>
   <features>
     <acpi/><apic/><pae/>
@@ -173,6 +187,7 @@ fn generate_vm_xml(vm: &VM, bridge: &str, disk_path: &str, iso_path: Option<&str
       <driver name='qemu' type='raw' cache='none' io='native'/>
       <source dev='{}'/>
       <target dev='vda' bus='virtio'/>
+      <boot order='{}'/>
     </disk>
     {}
     <interface type='bridge'>
@@ -191,7 +206,7 @@ fn generate_vm_xml(vm: &VM, bridge: &str, disk_path: &str, iso_path: Option<&str
     </console>
   </devices>
 </domain>"#,
-        vm.name, vm.id, vm.memory_mb, vm.cpu, boot_dev, disk_path, iso_xml, mac_xml, bridge
+        vm.name, vm.id, vm.memory_mb, vm.cpu, disk_path, disk_boot, iso_xml, mac_xml, bridge
     )
 }
 
@@ -199,7 +214,7 @@ fn generate_vm_xml(vm: &VM, bridge: &str, disk_path: &str, iso_path: Option<&str
 async fn get_vm_and_host(pool: r2d2::Pool<duckdb::DuckdbConnectionManager>, id: String) -> Result<(VM, crate::hosts::Host), ServerFnError> {
     tokio::task::spawn_blocking(move || -> Result<(VM, crate::hosts::Host), ServerFnError> {
         let conn = pool.get().map_err(srv_err)?;
-        let mut stmt = conn.prepare("SELECT v.id, v.host_id, h.name, v.name, v.cpu, v.memory_mb, v.status, v.os_type, v.disk_volume_id, v.iso_volume_id, v.boot_device, v.mac_address, v.vnc_port, v.vnc_token, h.address, h.port, h.username, h.password, h.ssh_key, h.ssh_passphrase FROM vms v JOIN hosts h ON v.host_id = h.id WHERE v.id = ?").map_err(srv_err)?;
+        let mut stmt = conn.prepare("SELECT v.id, v.host_id, h.name, v.name, v.cpu, v.memory_mb, v.status, v.os_type, v.disk_volume_id, v.iso_volume_id, v.boot_device, v.mac_address, v.vnc_port, v.vnc_token, h.address, h.port, h.username, h.password, h.ssh_key, h.ssh_passphrase, v.disk_size_gb FROM vms v JOIN hosts h ON v.host_id = h.id WHERE v.id = ?").map_err(srv_err)?;
         
         let (vm, host_addr, host_port, host_user, host_pass, host_ssh_key, host_ssh_pp) = stmt.query_row(params![id], |row| {
             Ok((
@@ -218,6 +233,7 @@ async fn get_vm_and_host(pool: r2d2::Pool<duckdb::DuckdbConnectionManager>, id: 
                     mac_address: row.get(11)?,
                     vnc_port: row.get(12)?,
                     vnc_token: row.get(13)?,
+                    disk_size_gb: row.get(20)?,
                 },
                 row.get::<_, String>(14)?,
                 row.get::<_, i32>(15)?,
@@ -277,20 +293,30 @@ pub async fn deploy_vm(id: String) -> Result<String, ServerFnError> {
                     .ok_or_else(|| "No Linstor controller found".to_string())?;
                 let linstor = crate::storage::linstor::LinstorClient::new(&controller.address);
                 
-                // Fix: passing u64 for size_gb
-                linstor.create_volume(pool_task.clone(), job_id_task.clone(), &vol_name, 20, 1).await?;
+                // Correctly use the VM's configured disk size
+                linstor.create_volume(pool_task.clone(), job_id_task.clone(), &vol_name, vm.disk_size_gb, 1).await?;
                 
                 // 3. Connect to Host and Deploy
                 let _ = crate::jobs::add_job_log(pool_task.clone(), job_id_task.clone(), format!("Connecting to host {}...", host.address)).await;
                 let sess = crate::hosts::establish_ssh_session(&host).map_err(|e| e.to_string())?;
                 
-                // 4. Detect Bridge
-                let (_, stdout, _) = crate::ssh::run_remote_script(&sess, "brctl show | awk 'NR>1 {print $1}' | grep -E 'br0|virbr0' | head -n 1", None).map_err(|e| e.to_string())?;
+                // 4. Detect Bridge (Prioritize br0 for physical network access)
+                let (_, stdout, _) = crate::ssh::run_remote_script(&sess, "brctl show | awk 'NR>1 {print $1}' | grep -E 'br0|br1|virbr0' | sort | head -n 1", None).map_err(|e| e.to_string())?;
                 let bridge = if stdout.trim().is_empty() { "virbr0" } else { stdout.trim() };
                 
-                // 5. Generate and Define XML
-                let disk_path = format!("/dev/linstor/cloudlab_pool/{}", vol_name);
-                let xml = generate_vm_xml(&vm, bridge, &disk_path, None);
+                // Fetch dynamic disk_path from Linstor directly instead of assuming hardcoded block
+                let (_, disk_path) = linstor.get_resource_placement(&vol_name).await?;
+                if disk_path.is_empty() {
+                    return Err(format!("Linstor returned an empty device path for volume {}", vol_name));
+                }
+
+                let iso_path = vm.iso_volume_id.as_ref().map(|iso| format!("/mnt/isos/{}", iso));
+
+                // 4.5 Wait for Linstor Resource to be UpToDate on host
+                let _ = crate::jobs::add_job_log(pool_task.clone(), job_id_task.clone(), format!("Waiting for volume '{}' to synchronize...", vol_name)).await;
+                linstor.wait_for_resource_uptodate(&vol_name, &host.name, Some(pool_task.clone()), Some(job_id_task.clone())).await.map_err(|e| format!("Storage Sync Error: {}", e))?;
+
+                let xml = generate_vm_xml(&vm, bridge, &disk_path, iso_path.as_deref());
                 let xml_escaped = xml.replace("'", "'\\''");
                 
                 let define_script = format!("echo '{}' > /tmp/{}.xml && virsh define /tmp/{}.xml && virsh start {}", xml_escaped, vm.id, vm.id, vm.name);
@@ -336,7 +362,9 @@ pub async fn update_vm(
     name: String,
     cpu: i32,
     memory_mb: i32,
+    disk_size_gb: i32,
     os_type: String,
+    boot_device: String,
 ) -> Result<(), ServerFnError> {
     #[cfg(feature = "ssr")]
     {
@@ -357,9 +385,9 @@ pub async fn update_vm(
             move || -> Result<(), ServerFnError> {
                 let conn = pool.get().map_err(srv_err)?;
                 conn.execute(
-                    "UPDATE vms SET host_id=?, name=?, cpu=?, memory_mb=?, os_type=? \
+                    "UPDATE vms SET host_id=?, name=?, cpu=?, memory_mb=?, disk_size_gb=?, os_type=?, boot_device=? \
                      WHERE id=?;",
-                    params![host_id, name, cpu, memory_mb, os_type, id],
+                    params![host_id, name, cpu, memory_mb, disk_size_gb, os_type, boot_device, id],
                 )
                 .map_err(srv_err)?;
                 Ok(())
@@ -374,12 +402,18 @@ pub async fn update_vm(
         if let Some(vol_name) = &vm.disk_volume_id {
             let sess = crate::hosts::establish_ssh_session(&host).map_err(srv_err)?;
             
-            // Detect Bridge
-            let (_, stdout, _) = crate::ssh::run_remote_script(&sess, "brctl show | awk 'NR>1 {{print $1}}' | grep -E 'br0|virbr0' | head -n 1", None).map_err(srv_err)?;
+            // 4. Detect Bridge (Prioritize br0 for physical network access)
+            let (_, stdout, _) = crate::ssh::run_remote_script(&sess, "brctl show | awk 'NR>1 {print $1}' | grep -E 'br0|br1|virbr0' | sort | head -n 1", None).map_err(srv_err)?;
             let bridge = if stdout.trim().is_empty() { "virbr0" } else { stdout.trim() };
             
-            let disk_path = format!("/dev/linstor/cloudlab_pool/{}", vol_name);
-            let xml = generate_vm_xml(&vm, bridge, &disk_path, None);
+            // Fetch dynamic disk_path from Linstor
+            let controller = crate::hosts::get_controller_host(pool.clone()).await.map_err(srv_err)?
+                .ok_or_else(|| srv_err("No Linstor controller found"))?;
+            let linstor = crate::storage::linstor::LinstorClient::new(&controller.address);
+            let (_, disk_path) = linstor.get_resource_placement(vol_name).await.map_err(srv_err)?;
+
+            let iso_path = vm.iso_volume_id.as_ref().map(|iso| format!("/mnt/isos/{}", iso));
+            let xml = generate_vm_xml(&vm, bridge, &disk_path, iso_path.as_deref());
             let xml_escaped = xml.replace("'", "'\\''");
             
             let define_script = format!("echo '{}' > /tmp/{}.xml && virsh define /tmp/{}.xml", xml_escaped, vm.id, vm.id);
@@ -406,11 +440,28 @@ pub async fn delete_vm(id: String) -> Result<(), ServerFnError> {
         use duckdb::DuckdbConnectionManager;
         use leptos_axum::extract;
         use r2d2::Pool;
+        use duckdb::params;
 
         let Extension(pool) = extract::<Extension<Pool<DuckdbConnectionManager>>>()
             .await
             .map_err(|_| srv_err("Failed to extract DB pool"))?;
 
+        // 1. Get info
+        let (vm, host) = get_vm_and_host(pool.clone(), id.clone()).await?;
+
+        // 2. SSH Cleanup (Libvirt)
+        if let Ok(sess) = crate::hosts::establish_ssh_session(&host) {
+            let cmd = format!("virsh destroy {} 2>/dev/null; virsh undefine {}", vm.name, vm.name);
+            let _ = crate::ssh::run_remote_script(&sess, &cmd, host.password.as_deref());
+        }
+
+        // 3. Linstor Cleanup
+        let linstor_ip = "192.168.7.69"; 
+        let client = crate::storage::linstor::LinstorClient::new(linstor_ip);
+        let vol_name = format!("vm-{}-disk", vm.id);
+        let _ = client.delete_volume(&vol_name).await;
+
+        // 4. DB Cleanup
         tokio::task::spawn_blocking(move || -> Result<(), ServerFnError> {
             let conn = pool.get().map_err(srv_err)?;
             conn.execute("DELETE FROM vms WHERE id=?;", params![id])
@@ -500,6 +551,83 @@ pub async fn reboot_vm(id: String) -> Result<(), ServerFnError> {
         if status != 0 {
             return Err(srv_err(format!("Reboot failed: {}", err)));
         }
+
+        Ok(())
+    }
+    #[cfg(not(feature = "ssr"))]
+    { unreachable!() }
+}
+
+#[server(ResetVM, "/api")]
+pub async fn reset_vm(id: String) -> Result<(), ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        crate::auth::require_role(crate::auth::UserRole::Operator).await?;
+        use axum::extract::Extension;
+        use duckdb::DuckdbConnectionManager;
+        use leptos_axum::extract;
+        use r2d2::Pool;
+
+        let Extension(pool) = extract::<Extension<Pool<DuckdbConnectionManager>>>()
+            .await
+            .map_err(|_| srv_err("Failed to extract DB pool"))?;
+
+        let (vm, host) = get_vm_and_host(pool.clone(), id.clone()).await?;
+        let sess = crate::hosts::establish_ssh_session(&host).map_err(srv_err)?;
+
+        let (status, _, err) = crate::ssh::run_remote_script(&sess, &format!("virsh reset {}", vm.name), host.password.as_deref()).map_err(srv_err)?;
+        if status != 0 {
+            return Err(srv_err(format!("Reset failed: {}", err)));
+        }
+
+        Ok(())
+    }
+    #[cfg(not(feature = "ssr"))]
+    { unreachable!() }
+}
+
+#[server(ResizeVMDisk, "/api")]
+pub async fn resize_vm_disk(id: String, new_size_gb: i32) -> Result<(), ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        crate::auth::require_role(crate::auth::UserRole::Operator).await?;
+        use axum::extract::Extension;
+        use duckdb::DuckdbConnectionManager;
+        use leptos_axum::extract;
+        use r2d2::Pool;
+
+        let Extension(pool) = extract::<Extension<Pool<DuckdbConnectionManager>>>()
+            .await
+            .map_err(|_| srv_err("Failed to extract DB pool"))?;
+
+        let (vm, host) = get_vm_and_host(pool.clone(), id.clone()).await?;
+
+        // 1. Resize in Linstor
+        let controller = crate::hosts::get_controller_host(pool.clone()).await
+            .map_err(|e| srv_err(format!("DB error: {}", e)))?
+            .ok_or_else(|| srv_err("No Linstor controller found"))?;
+        
+        let linstor = crate::storage::linstor::LinstorClient::new(&controller.address);
+        let vol_name = vm.disk_volume_id.clone().unwrap_or_else(|| format!("vm-{}-disk", vm.name));
+        linstor.resize_volume(&vol_name, 0, new_size_gb).await.map_err(srv_err)?;
+
+        // 2. Resize in Libvirt (if running)
+        if vm.status == "running" {
+            if let Ok(sess) = crate::hosts::establish_ssh_session(&host) {
+                let cmd = format!("virsh blockresize {} vda {}G", vm.name, new_size_gb);
+                let _ = crate::ssh::run_remote_script(&sess, &cmd, host.password.as_deref());
+            }
+        }
+
+        // 3. Update DB
+        tokio::task::spawn_blocking(move || -> Result<(), ServerFnError> {
+            let conn = pool.get().map_err(srv_err)?;
+            conn.execute("UPDATE vms SET disk_size_gb=? WHERE id=?;", params![new_size_gb, id])
+                .map_err(srv_err)?;
+            Ok(())
+        })
+        .await
+        .map_err(srv_err)??;
 
         Ok(())
     }
@@ -616,17 +744,57 @@ pub async fn get_vm_console(id: String) -> Result<String, ServerFnError> {
         let (_, stdout, _) = crate::ssh::run_remote_script(&sess, &cmd, host.password.as_deref()).map_err(srv_err)?;
         
         // Output looks like ":1" or "127.0.0.1:0"
-        let display = stdout.trim().trim_start_matches(':');
+        let display = stdout.trim().split(':').last().unwrap_or("0");
         let vnc_port = 5900 + display.parse::<i32>().unwrap_or(0);
         
         // 2. Ensure websockify is running on host for this VM
-        // We'll use a predictable websockify port: 6000 + display_index
-        let ws_port = 6000 + display.parse::<i32>().unwrap_or(0);
-        let ws_cmd = format!("pgrep -f 'websockify.*{}' || websockify -D --web /usr/share/novnc/ {} localhost:{}", ws_port, ws_port, vnc_port);
-        let _ = crate::ssh::run_remote_script(&sess, &ws_cmd, host.password.as_deref()).map_err(srv_err)?;
+        // Resolve noVNC directory, binary and file dynamically
+        let resolve_cmd = r#"
+            NOVNC_DIR=""
+            for d in /usr/share/novnc /usr/share/novnc-utils /var/lib/novnc; do
+                if [ -d "$d" ]; then NOVNC_DIR="$d"; break; fi
+            done
+            VNC_FILE="vnc.html"
+            if [ -n "$NOVNC_DIR" ] && [ ! -f "$NOVNC_DIR/vnc.html" ] && [ -f "$NOVNC_DIR/vnc_lite.html" ]; then
+                VNC_FILE="vnc_lite.html"
+            fi
+            WS_BIN=$(command -v websockify || echo "/usr/bin/websockify")
+            IS_VNC_UP=$(ss -ltn | grep -q ":$vnc_port" && echo "YES" || echo "NO")
+            echo "$NOVNC_DIR|$VNC_FILE|$WS_BIN|$IS_VNC_UP"
+        "#;
+        let (_, rs_stdout, _) = crate::ssh::run_remote_script(&sess, resolve_cmd, host.password.as_deref()).map_err(srv_err)?;
+        let resolved = rs_stdout.trim();
+        let parts: Vec<&str> = resolved.split('|').collect();
+        
+        let (novnc_dir, vnc_file, ws_bin, is_vnc_up) = if parts.len() == 4 {
+            (parts[0], parts[1], parts[2], parts[3])
+        } else {
+            ("/usr/share/novnc", "vnc.html", "websockify", "UNKNOWN")
+        };
+
+        leptos::logging::log!("DEBUG: VNC Diagnostic for VM {}: noVNC Dir={}, Entry={}, Bin={}, VNC Port {} Up={}", 
+            vm.name, novnc_dir, vnc_file, ws_bin, vnc_port, is_vnc_up);
+
+        if is_vnc_up == "NO" {
+            return Err(srv_err(format!("VNC Backend port {} is not listening on host {}. Is the VM running?", vnc_port, host.address)));
+        }
+
+        // We'll use a predictable websockify port: 6080 + display_index
+        let ws_port = 6080 + display.parse::<i32>().unwrap_or(0);
+        
+        // Use ss check instead of pgrep for more accuracy on actual listener state
+        let ws_cmd = format!(
+            "ss -ltn | grep -q :{} || (nohup {} --web {} {} 127.0.0.1:{} > /tmp/websockify_{}.log 2>&1 & sleep 1)", 
+            ws_port, ws_bin, novnc_dir, ws_port, vnc_port, ws_port
+        );
+        
+        let (ws_status, ws_out, ws_err) = crate::ssh::run_remote_script(&sess, &ws_cmd, host.password.as_deref()).map_err(srv_err)?;
+        if ws_status != 0 {
+             leptos::logging::log!("WARN: Diagnostic start failed for {}: {}. Output: {}", host.address, ws_err, ws_out);
+        }
 
         // 3. Construct URL
-        let url = format!("http://{}:{}/vnc.html?autoconnect=true", host.address, ws_port);
+        let url = format!("http://{}:{}/{}?autoconnect=true", host.address, ws_port, vnc_file);
         
         Ok(url)
     }
@@ -681,14 +849,20 @@ pub async fn migrate_vm(id: String, target_host_id: String) -> Result<(), Server
         // 3. Define and Start on Target
         let target_sess = crate::hosts::establish_ssh_session(&target_host).map_err(srv_err)?;
         
-        // Detect Bridge on Target
-        let (_, stdout, _) = crate::ssh::run_remote_script(&target_sess, "brctl show | awk 'NR>1 {{print $1}}' | grep -E 'br0|virbr0' | head -n 1", None).map_err(srv_err)?;
+        // Detect Bridge on Target (Prioritize br0 for physical network access)
+        let (_, stdout, _) = crate::ssh::run_remote_script(&target_sess, "brctl show | awk 'NR>1 {print $1}' | grep -E 'br0|br1|virbr0' | sort | head -n 1", None).map_err(srv_err)?;
         let bridge = if stdout.trim().is_empty() { "virbr0" } else { stdout.trim() };
         
         let vol_name = vm.disk_volume_id.clone().ok_or_else(|| srv_err("VM has no disk volume"))?;
-        let disk_path = format!("/dev/linstor/cloudlab_pool/{}", vol_name);
         
-        let xml = generate_vm_xml(&vm, bridge, &disk_path, None);
+        // Fetch dynamic disk_path from Linstor on Target
+        let controller = crate::hosts::get_controller_host(pool.clone()).await.map_err(srv_err)?
+            .ok_or_else(|| srv_err("No Linstor controller found"))?;
+        let linstor = crate::storage::linstor::LinstorClient::new(&controller.address);
+        let (_, disk_path) = linstor.get_resource_placement(&vol_name).await.map_err(srv_err)?;
+        
+        let iso_path = vm.iso_volume_id.as_ref().map(|iso| format!("/mnt/isos/{}", iso));
+        let xml = generate_vm_xml(&vm, bridge, &disk_path, iso_path.as_deref());
         let xml_escaped = xml.replace("'", "'\\''");
         
         let define_script = format!("echo '{}' > /tmp/{}.xml && virsh define /tmp/{}.xml && virsh start {}", xml_escaped, vm.id, vm.id, vm.name);
@@ -735,10 +909,18 @@ pub async fn ensure_iso_volume(sess: &ssh2::Session, host_name: &str) -> Result<
              sleep 1\n\
            done\n\
            if [[ ! -b \"$DEVICE\" ]]; then echo 'Device not found'; exit 1; fi\n\
-           if ! sudo blkid \"$DEVICE\"; then sudo mkfs.ext4 \"$DEVICE\"; fi\n\
-           sudo mkdir -p /mnt/isos\n\
-           sudo mount \"$DEVICE\" /mnt/isos\n\
-         fi",
+            if ! sudo blkid \"$DEVICE\"; then sudo mkfs.ext4 \"$DEVICE\"; fi\n\
+            sudo mkdir -p /mnt/isos\n\
+            echo \"Mounting $DEVICE to /mnt/isos...\"\n\
+            if ! sudo mount \"$DEVICE\" /mnt/isos; then\n\
+              echo \"CRITICAL: Failed to mount $DEVICE. Check dmesg.\"\n\
+              exit 1\n\
+            fi\n\
+          fi\n\
+          sudo chown -R cloudlab:cloudlab /mnt/isos\n\
+          sudo chmod 755 /mnt/isos\n\
+          sudo chmod -R 644 /mnt/isos/*.iso 2>/dev/null || true\n\
+          sudo chmod 755 /mnt/isos/*/ 2>/dev/null || true",
         host_name
     );
 
@@ -791,7 +973,7 @@ pub async fn list_isos(host_id: String) -> Result<Vec<String>, ServerFnError> {
         // Ensure volume is mounted
         ensure_iso_volume(&sess, &host.name).await.map_err(srv_err)?;
 
-        let (_, stdout, _) = crate::ssh::run_remote_script(&sess, "ls /mnt/isos/ | grep .iso || true", None).map_err(srv_err)?;
+        let (_, stdout, _) = crate::ssh::run_remote_script(&sess, "find /mnt/isos/ -type f -name \"*.iso\" | sed 's|/mnt/isos/||' || true", None).map_err(srv_err)?;
         let isos = stdout.lines().map(|s| s.to_string()).collect();
         
         Ok(isos)

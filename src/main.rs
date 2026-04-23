@@ -40,7 +40,7 @@ async fn main() {
         let _ = conn.execute("ALTER TABLE hosts ADD COLUMN zfs_pool_size_gb INTEGER DEFAULT 100;", duckdb::params![]);
         let _ = conn.execute("ALTER TABLE hosts ADD COLUMN storage_device VARCHAR;", duckdb::params![]);
         
-        conn.execute("CREATE TABLE IF NOT EXISTS vms (id VARCHAR PRIMARY KEY, host_id VARCHAR, name VARCHAR NOT NULL, cpu INTEGER DEFAULT 1, memory_mb INTEGER DEFAULT 1024, status VARCHAR DEFAULT 'stopped', os_type VARCHAR DEFAULT 'linux', disk_volume_id VARCHAR, iso_volume_id VARCHAR, boot_device VARCHAR DEFAULT 'disk', mac_address VARCHAR, vnc_port INTEGER, vnc_token VARCHAR);", duckdb::params![]).unwrap();
+        conn.execute("CREATE TABLE IF NOT EXISTS vms (id VARCHAR PRIMARY KEY, host_id VARCHAR, name VARCHAR NOT NULL, cpu INTEGER DEFAULT 1, memory_mb INTEGER DEFAULT 1024, disk_size_gb INTEGER DEFAULT 20, status VARCHAR DEFAULT 'stopped', os_type VARCHAR DEFAULT 'linux', disk_volume_id VARCHAR, iso_volume_id VARCHAR, boot_device VARCHAR DEFAULT 'disk', mac_address VARCHAR, vnc_port INTEGER, vnc_token VARCHAR);", duckdb::params![]).unwrap();
         // Migration: add extra columns if table already existed
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN disk_volume_id VARCHAR;", duckdb::params![]);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN iso_volume_id VARCHAR;", duckdb::params![]);
@@ -48,6 +48,7 @@ async fn main() {
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN mac_address VARCHAR;", duckdb::params![]);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN vnc_port INTEGER;", duckdb::params![]);
         let _ = conn.execute("ALTER TABLE vms ADD COLUMN vnc_token VARCHAR;", duckdb::params![]);
+        let _ = conn.execute("ALTER TABLE vms ADD COLUMN disk_size_gb INTEGER DEFAULT 20;", duckdb::params![]);
 
         conn.execute("CREATE TABLE IF NOT EXISTS api_keys (id VARCHAR PRIMARY KEY, label VARCHAR NOT NULL, key_prefix VARCHAR NOT NULL, hashed_key VARCHAR NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);", duckdb::params![]).unwrap();
         conn.execute("CREATE TABLE IF NOT EXISTS llms (id VARCHAR PRIMARY KEY, host_id VARCHAR, name VARCHAR NOT NULL, provider VARCHAR NOT NULL, model_name VARCHAR NOT NULL, status VARCHAR DEFAULT 'offline', repo_id VARCHAR, size_bytes BIGINT DEFAULT 0, download_status VARCHAR DEFAULT 'none', last_synced_at TIMESTAMP, UNIQUE(host_id, provider, model_name));", duckdb::params![]).unwrap();

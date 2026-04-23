@@ -237,7 +237,16 @@ chmod 775 "$MOUNT_POINT"
                     }.await;
 
                     return match res {
-                        Ok(_) => StatusCode::OK.into_response(),
+                        Ok(_) => {
+                            // Ensure world-readable permissions after upload
+                            match establish_ssh_session(&host) {
+                                Ok(sess) => {
+                                    let _ = crate::ssh::run_remote_script(&sess, &format!("sudo chmod 644 '{}'", full_path), host.password.as_deref());
+                                    StatusCode::OK.into_response()
+                                }
+                                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Permission fix failed: {}", e)).into_response(),
+                            }
+                        }
                         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Upload failed: {}", e)).into_response(),
                     };
                 }

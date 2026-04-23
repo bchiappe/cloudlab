@@ -4,11 +4,10 @@ use crate::llms::*;
 use leptos::task::spawn_local;
 
 #[component]
-pub fn ChatInterface() -> impl IntoView {
+pub fn ChatInterface(selected_id: RwSignal<Option<String>>) -> impl IntoView {
     let (messages, set_messages) = signal(Vec::<ChatMessage>::new());
     let (input, set_input) = signal(String::new());
     let (is_loading, set_is_loading) = signal(false);
-    let (selected_id, set_selected_id) = signal(Option::<String>::None);
     let (active_thread_id, set_active_thread_id) = signal(Option::<String>::None);
     let (show_sidebar, set_show_sidebar) = signal(true);
 
@@ -159,9 +158,10 @@ pub fn ChatInterface() -> impl IntoView {
                             <select 
                                 class="bg-black/40 border border-gray-800 rounded-xl px-4 py-2 text-xs text-white focus:outline-none focus:border-blue-500 transition-all cursor-pointer hover:bg-black/60"
                                 on:change=move |ev| {
-                                    set_selected_id.set(Some(event_target_value(&ev)));
+                                    selected_id.set(Some(event_target_value(&ev)));
                                     clear_chat();
                                 }
+                                prop:value=move || selected_id.get().unwrap_or_default()
                             >
                                 <option value="">"Select Model"</option>
                                 {move || list_llms_resource.get().map(|llms| {

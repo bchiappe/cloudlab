@@ -46,7 +46,7 @@ pub mod linstor {
             Self {
                 base_url: format!("http://{}:3370/v1", controller_addr),
                 http: Client::builder()
-                    .timeout(std::time::Duration::from_secs(5))
+                    .timeout(std::time::Duration::from_secs(60))
                     .build()
                     .unwrap_or_default(),
             }
@@ -87,31 +87,98 @@ pub mod linstor {
             replicas: i32
         ) -> Result<(), String> {
             let _ = crate::jobs::update_job(pool.clone(), job_id.clone(), "running".into(), 10).await;
-            let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Linstor: Creating volume {} ({}GB, replicas={})", name, size_gb, replicas)).await;
+            let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Linstor: Creating resource definition {}", name)).await;
 
-            let body = json!({
+            let rd_body = json!({
                 "resource_definition": {
                     "name": name,
-                    "layer_stack": ["DRBD", "STORAGE"],
-                    "auto_place": replicas
-                },
-                "volume_definitions": [
-                    {
-                        "size_kib": (size_gb as u64) * 1024 * 1024
-                    }
-                ]
+                    "resource_group_name": "DfltRscGrp"
+                }
             });
 
-            let resp = self.http.post(&format!("{}/view/resources", self.base_url))
-                .json(&body)
+            let rd_resp = self.http.post(&format!("{}/resource-definitions", self.base_url))
+                .json(&rd_body)
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
 
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let err_text = resp.text().await.unwrap_or_default();
-                let err_msg = format!("Linstor Error {}: {}", status, err_text);
+            if !rd_resp.status().is_success() {
+                let status = rd_resp.status();
+                let err_text = rd_resp.text().await.unwrap_or_default();
+                if !err_text.contains("already exists") {
+                    let err_msg = format!("Linstor RD Error {}: {}", status, err_text);
+                    let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Error: {}", err_msg)).await;
+                    let _ = crate::jobs::update_job(pool.clone(), job_id.clone(), "failed".into(), 0).await;
+                    return Err(err_msg);
+                }
+            }
+
+            let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Linstor: Checking volume definitions for {}", name)).await;
+            
+            let list_vd_resp = self.http.get(&format!("{}/resource-definitions/{}/volume-definitions", self.base_url, name))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let mut volumes_exist = false;
+            if list_vd_resp.status().is_success() {
+                let existing_vds: serde_json::Value = list_vd_resp.json().await.unwrap_or_default();
+                if let Some(arr) = existing_vds.as_array() {
+                    if !arr.is_empty() {
+                        volumes_exist = true;
+                        let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), "Linstor: Volume definition already exists, skipping creation.".into()).await;
+                    }
+                }
+            }
+
+            if !volumes_exist {
+                let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Linstor: Creating volume definition for {} ({}GB)", name, size_gb)).await;
+
+                let vd_body = json!({
+                    "volume_definition": {
+                        "size_kib": (size_gb as u64) * 1024 * 1024
+                    }
+                });
+
+                let vd_resp = self.http.post(&format!("{}/resource-definitions/{}/volume-definitions", self.base_url, name))
+                    .json(&vd_body)
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                if !vd_resp.status().is_success() {
+                    let status = vd_resp.status();
+                    let err_text = vd_resp.text().await.unwrap_or_default();
+                    if !err_text.contains("already exists") {
+                        let err_msg = format!("Linstor VD Error {}: {}", status, err_text);
+                        let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Error: {}", err_msg)).await;
+                        let _ = crate::jobs::update_job(pool.clone(), job_id.clone(), "failed".into(), 0).await;
+                        return Err(err_msg);
+                    }
+                }
+            } else {
+                // If it exists, try to resize it to the requested size just in case it was created smaller
+                let _ = self.resize_volume(name, 0, size_gb).await;
+            }
+
+            let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Linstor: Auto-placing {} with {} replicas", name, replicas)).await;
+
+            let ap_body = json!({
+                "select_filter": {
+                    "place_count": replicas
+                }
+            });
+
+            let ap_resp = self.http.post(&format!("{}/resource-definitions/{}/autoplace", self.base_url, name))
+                .json(&ap_body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if !ap_resp.status().is_success() {
+                let status = ap_resp.status();
+                let err_text = ap_resp.text().await.unwrap_or_default();
+                let err_msg = format!("Linstor Autoplace Error {}: {}", status, err_text);
                 let _ = crate::jobs::add_job_log(pool.clone(), job_id.clone(), format!("Error: {}", err_msg)).await;
                 let _ = crate::jobs::update_job(pool.clone(), job_id.clone(), "failed".into(), 0).await;
                 return Err(err_msg);
@@ -137,6 +204,24 @@ pub mod linstor {
             Ok(())
         }
 
+        pub async fn resize_volume(&self, resource_name: &str, volume_nr: i32, new_size_gb: i32) -> Result<(), String> {
+            let body = json!({
+                "volume_definition": {
+                    "size_kib": (new_size_gb as u64) * 1024 * 1024
+                }
+            });
+            let resp = self.http.put(&format!("{}/resource-definitions/{}/volume-definitions/{}", self.base_url, resource_name, volume_nr))
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            if !resp.status().is_success() {
+                return Err(format!("Linstor Resize Error {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
+            }
+            Ok(())
+        }
+
         pub async fn get_resource_placement(&self, volume_name: &str) -> Result<(String, String), String> {
             let resp = self.http.get(&format!("{}/view/resources?resource_names={}", self.base_url, volume_name))
                 .send()
@@ -154,23 +239,16 @@ pub mod linstor {
                 return Err(format!("Resource '{}' not found in Linstor", volume_name));
             }
 
-            // Linstor API versions vary:
-            // 1. Newer versions return an array of resource definitions, each with a "placements" list.
-            // 2. Older versions (observed in debug logs) return an array of resource instances (placements) directly.
             let first = arr.first().unwrap();
             let placements = if let Some(nested) = first["placements"].as_array() {
                 nested
             } else {
-                // Flat format: the entire array consists of placements
                 arr
             };
 
             if placements.is_empty() {
                 return Err(format!("Resource '{}' is not assigned to any nodes", volume_name));
             }
-
-            // Diagnostic logging for placement selection
-            leptos::logging::log!("DEBUG: Found {} placements for '{}'", placements.len(), volume_name);
 
             // 1. Try to find a placement that is explicitly in sync
             let in_sync = placements.iter().find(|p| {
@@ -180,9 +258,7 @@ pub mod linstor {
                 }
             });
 
-            // 2. Fallback to the first placement if no in-sync one is found
             let p = in_sync.or_else(|| {
-                leptos::logging::log!("WARN: No UpToDate placement for '{}', falling back to first available node", volume_name);
                 placements.first()
             }).unwrap();
 
@@ -201,8 +277,97 @@ pub mod linstor {
             Ok((node, path))
         }
 
+        pub async fn wait_for_resource_uptodate(
+            &self, 
+            volume_name: &str, 
+            target_node: &str,
+            pool: Option<Pool<DuckdbConnectionManager>>,
+            job_id: Option<String>
+        ) -> Result<(), String> {
+            let mut attempts = 0;
+            let max_attempts = 60; // Increased to 60s
+            leptos::logging::log!("DEBUG: Waiting for resource '{}' to be UpToDate on node '{}'", volume_name, target_node);
+            
+            while attempts < max_attempts {
+                let resp = self.http.get(&format!("{}/view/resources?resource_names={}", self.base_url, volume_name))
+                    .send()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                
+                if resp.status().is_success() {
+                    if let Ok(resources) = resp.json::<serde_json::Value>().await {
+                        let arr = resources.as_array().map(|a| a.as_slice()).unwrap_or(&[]);
+                        let placements = if let Some(first) = arr.first() {
+                            if let Some(nested) = first["placements"].as_array() { nested.as_slice() } else { arr }
+                        } else { arr };
+
+                        let mut found_node = false;
+                        for p in placements {
+                            let node_name = p["node_name"].as_str().unwrap_or_default();
+                            if node_name == target_node {
+                                found_node = true;
+                                let state = if let Some(s) = p["state"].as_str() {
+                                    s.to_string()
+                                } else if let Some(obj) = p["state"].as_object() {
+                                    if let Some(ds) = obj.get("disk_state").and_then(|v| v.as_str()) {
+                                        ds.to_string()
+                                    } else if let Some(vols) = p["volumes"].as_array() {
+                                        // Aggregate state from all volumes
+                                        let all_uptodate = !vols.is_empty() && vols.iter().all(|v| {
+                                            v["state"]["disk_state"].as_str().map(|s| s.to_lowercase()) == Some("uptodate".into())
+                                        });
+                                        if all_uptodate { "UpToDate".into() } else { "Syncing".into() }
+                                    } else {
+                                        "unknown".to_string()
+                                    }
+                                } else {
+                                    "unknown".to_string()
+                                };
+                                let in_sync = p["state_in_sync"].as_bool().unwrap_or_else(|| {
+                                    state.to_lowercase() == "uptodate" || state.to_lowercase() == "insync"
+                                });
+                                
+                                let msg = format!("Storage Status [{}]: node={}, state={}, in_sync={}", volume_name, target_node, state, in_sync);
+                                leptos::logging::log!("DEBUG: {}", msg);
+                                
+                                if let (Some(p), Some(jid)) = (&pool, &job_id) {
+                                    let _ = crate::jobs::add_job_log(p.clone(), jid.clone(), msg).await;
+                                }
+
+                                if state.to_lowercase() == "uptodate" || in_sync {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        if !found_node {
+                            let available_nodes: Vec<&str> = placements.iter().filter_map(|p| p["node_name"].as_str()).collect();
+                            let msg = format!("WARN: Node '{}' not found in placements for '{}'. Available: {:?}", target_node, volume_name, available_nodes);
+                            leptos::logging::log!("{}", msg);
+                            if let (Some(p), Some(jid)) = (&pool, &job_id) {
+                                let _ = crate::jobs::add_job_log(p.clone(), jid.clone(), msg).await;
+                            }
+                        }
+                    }
+                } else {
+                    let err_msg = format!("ERROR: Linstor API failed with status {}: {}", resp.status(), resp.text().await.unwrap_or_default());
+                    leptos::logging::log!("{}", err_msg);
+                    if let (Some(p), Some(jid)) = (&pool, &job_id) {
+                        let _ = crate::jobs::add_job_log(p.clone(), jid.clone(), err_msg).await;
+                    }
+                }
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            let raw_status = match self.http.get(&format!("{}/view/resources/{}", self.base_url, volume_name)).send().await {
+                Ok(resp) => resp.text().await.unwrap_or_else(|_| "Could not read status body".into()),
+                Err(e) => format!("Could not fetch status: {}", e),
+            };
+            let err_reports = self.get_error_reports().await.unwrap_or_else(|e| format!("Could not fetch error reports: {} ", e));
+            Err(format!("Timeout waiting for resource {} to be UpToDate on {}.\n\nRAW LINSTOR STATUS:\n{}\n\nLINSTOR ERROR REPORTS:\n{}", volume_name, target_node, raw_status, err_reports))
+        }
+
         pub async fn get_error_reports(&self) -> Result<String, String> {
-            let resp = self.http.get(&format!("{}/error-reports?limit=5", self.base_url))
+            let resp = self.http.get(&format!("{}/error-reports?limit=50", self.base_url))
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;

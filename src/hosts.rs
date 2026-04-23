@@ -591,10 +591,11 @@ pub async fn setup_host_task(
              chmod 600 /home/cloudlab/.ssh/authorized_keys\n\
              echo 'cloudlab ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/cloudlab\n\
              apt-get update\n\
-             apt-get install -y software-properties-common\n\
-             add-apt-repository -y ppa:linbit/linbit-drbd9-stack\n\
-             apt-get update\n\
-             apt-get install -y zfsutils-linux lvm2 drbd-dkms drbd-utils linstor-satellite qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils docker.io curl ca-certificates lsof psmisc ubuntu-drivers-common novnc websockify {}\n\
+             apt-get install -y linux-headers-$(uname -r) || true\n\
+             apt-get install -y zfsutils-linux lvm2 drbd-dkms drbd-utils linstor-satellite linstor-client qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils docker.io curl ca-certificates lsof psmisc ubuntu-drivers-common novnc websockify {}\n\
+             apt-get install --only-upgrade -y linstor-satellite linstor-client || true\n\
+             dkms autoinstall || true\n\
+             modprobe drbd || echo \"DRBD Module Load Failed\"\n\
              usermod -aG docker cloudlab\n\
              usermod -aG libvirt cloudlab\n\
              systemctl enable --now docker\n\
@@ -620,19 +621,19 @@ pub async fn setup_host_task(
                    echo \"REBOOT_REQUIRED: NVIDIA drivers installed. Please reboot the host.\"\n\
                 fi\n\
                 echo \"NVIDIA GPU detected. Installing/Configuring NVIDIA Container Toolkit...\"\n\
-                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg || true\n\
+                curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor --batch --yes -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg || true\n\
                 curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \\\n\
                   sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \\\n\
                   sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list || true\n\
                 apt-get update\n\
-                apt-get install -y nvidia-container-toolkit nvidia-cuda-toolkit libvulkan1 vulkan-tools build-essential cmake git pkg-config libvulkan-dev\\n\\
-                if ! command -v rustc &> /dev/null; then\\n\\
-                    echo \"Installing Rust toolchain...\"\\n\\
-                    curl -fsSL https://sh.rustup.rs | sh -s -- -y\\n\\
-                    source $HOME/.cargo/env\\n\\
-                fi\\n\\
-                echo \"--- Host Library Check ---\"\\n\\
-                ldconfig -p | grep -E \"cublas|cudart|vulkan\" || true\\n\\
+                apt-get install -y nvidia-container-toolkit nvidia-cuda-toolkit libvulkan1 vulkan-tools build-essential cmake git pkg-config libvulkan-dev\n\
+                if ! command -v rustc &> /dev/null; then\n\
+                    echo \"Installing Rust toolchain...\"\n\
+                    curl -fsSL https://sh.rustup.rs | sh -s -- -y\n\
+                    source $HOME/.cargo/env\n\
+                fi\n\
+                echo \"--- Host Library Check ---\"\n\
+                ldconfig -p | grep -E \"cublas|cudart|vulkan\" || true\n\
                 \n\
                 # Deep Fix for Docker Runtime\n\
                 echo \"Configuring NVIDIA runtime for Docker...\"\n\
@@ -704,7 +705,7 @@ pub async fn setup_host_task(
                 echo \"Using file-backed storage pool\"\n\
                 if sudo zpool list cloudlab_zpool >/dev/null 2>&1 && ! sudo zpool list -v cloudlab_zpool | grep -q \".img\"; then\n\
                    echo \"Physical pool detected but file requested. Destroying to migrate to file...\"\n\
-                   sudo zfs unmount -a || true\n\
+                sudo zfs unmount -a || true\n\
                    sudo zpool export -f cloudlab_zpool || true\n\
                    sudo zpool destroy -f cloudlab_zpool\n\
                    udevadm settle || true\n\
@@ -728,14 +729,36 @@ pub async fn setup_host_task(
              udevadm settle || true\n\
              \n\
              echo \"PROVISIONING_STEP: Registering with LINSTOR\"\n\
+             hostnamectl set-hostname {} || true\n\
+             systemctl restart linstor-satellite || true\n\
+             ufw disable || true\n\
+             # Purge nodes with the SAME IP or conflicting names to avoid identity mismatches\n\
+             OBSOLETE_NODES=$(linstor node list --column Node,IP | grep '{}' | awk '{{print $1}}' || true)\n\
+             for node in $OBSOLETE_NODES; do\n\
+                 echo \"Purging obsolete node identity: $node\"\n\
+                 linstor node delete \"$node\" || true\n\
+             done\n\
+             linstor node delete cloudlab1 || true\n\
+             linstor node delete {} || true\n\
              linstor node create {} {} --node-type SATELLITE || true\n\
+             linstor node interface modify {} default --ip {} || true\n\
+             # Wait for handshake and layer discovery\n\
+             sleep 15\n\
+             echo \"--- LINSTOR NODE STATUS ---\"\n\
+             linstor node list || true\n\
+             linstor node list-properties {} || true\n\
+             echo \"--- DRBD STATUS ---\"\n\
+             drbdadm --version || true\n\
+             drbdsetup status || true\n\
+             echo \"--- SATELLITE LOGS (Last 50) ---\"\n\
+             journalctl -u linstor-satellite --no-pager -n 50 || true\n\
              linstor resource-group create default || true\n\
-             linstor storage-pool create zfs {} cloudlab_pool cloudlab_zpool || echo \"Linstor Pool Registration Failed (already exists?)\"",
+             linstor storage-pool create zfs {} cloudlab_pool cloudlab_zpool || linstor storage-pool list --node {} | grep -q \"cloudlab_pool\"",
             cloudlab_keys.public_key,
             extra_packages,
             storage_device.clone().unwrap_or_default(),
             zfs_pool_size,
-            node_name_inner, address_inner, node_name_inner
+            node_name_inner, address_inner, node_name_inner, node_name_inner, address_inner, node_name_inner, address_inner, node_name_inner, node_name_inner, node_name_inner
         );
 
         let (status, stdout, stderr) = crate::ssh::run_remote_script(&sess, &script, if method == "password" { Some(&pw) } else { None })?;
@@ -772,8 +795,9 @@ pub async fn setup_host_task(
             let controller_sess = crate::hosts::get_host_session_blocking(&conn, &controller_id)?;
             let reg_script = format!(
                 "linstor node create {} {} --node-type SATELLITE || true\n\
+                 linstor node interface modify {} default --ip {} || true\n\
                  linstor storage-pool create zfs {} cloudlab_pool cloudlab_zpool || true",
-                node_name, address, node_name
+                node_name, address, node_name, address, node_name
             );
             let (r_status, r_out, r_err) = crate::ssh::run_remote_script(&controller_sess, &reg_script, None)?;
             if r_status != 0 {

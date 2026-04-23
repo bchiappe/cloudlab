@@ -30,8 +30,8 @@ pub struct ChatThread {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HFModel {
     pub id: String,
-    pub downloads: Option<i32>,
-    pub likes: Option<i32>,
+    pub downloads: Option<i64>,
+    pub likes: Option<i64>,
 }
 
 pub fn srv_err(msg: impl std::fmt::Display) -> ServerFnError {
@@ -651,8 +651,13 @@ pub async fn deploy_fox(host_id: String) -> Result<(), ServerFnError> {
                 if [[ ! -b '$DEVICE' ]]; then exit 1; fi\n\
                 if ! sudo blkid '$DEVICE'; then sudo mkfs.ext4 '$DEVICE'; fi\n\
                 sudo mkdir -p /mnt/llm-models\n\
-                sudo mount '$DEVICE' /mnt/llm-models\n\
+                echo \"Mounting $DEVICE to /mnt/llm-models...\"\n\
+                if ! sudo mount \"$DEVICE\" /mnt/llm-models; then\n\
+                  echo \"CRITICAL: Failed to mount $DEVICE. Check dmesg.\"\n\
+                  exit 1\n\
+                fi\n\
               fi\n\
+              sudo chown -R cloudlab:cloudlab /mnt/llm-models\n\
               \n\
               # 0. Global Clean Start\n\
               sudo systemctl stop fox || true\n\
@@ -974,18 +979,27 @@ pub async fn pull_model(host_id: String, model_repo: String) -> Result<(), Serve
 
 #[server(SearchHFModels, "/api")]
 pub async fn search_hf_models(query: String) -> Result<Vec<HFModel>, ServerFnError> {
-    let url = format!("https://huggingface.co/api/models?search={}&filter=gguf&sort=downloads&direction=-1&limit=20", query);
-    
-    let client = reqwest::Client::new();
-    let resp = client.get(url)
-        .header("User-Agent", "CloudLab/1.0")
-        .send()
-        .await
-        .map_err(|e| srv_err(&format!("HF Search failed: {}", e)))?;
+    #[cfg(feature = "ssr")]
+    {
+        let encoded_query = urlencoding::encode(&query);
+        let url = format!("https://huggingface.co/api/models?search={}&filter=gguf&sort=downloads&direction=-1&limit=20", encoded_query);
         
-    let models: Vec<HFModel> = resp.json()
-        .await
-        .map_err(|e| srv_err(&format!("Failed to parse HF response: {}", e)))?;
-        
-    Ok(models)
+        let client = reqwest::Client::new();
+        let resp = client.get(url)
+            .header("User-Agent", "CloudLab/1.0")
+            .send()
+            .await
+            .map_err(|e| srv_err(&format!("HF Search failed: {}", e)))?;
+            
+        let models: Vec<HFModel> = resp.json()
+            .await
+            .map_err(|e| srv_err(&format!("Failed to parse HF response: {}", e)))?;
+            
+        Ok(models)
+    }
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = query;
+        unreachable!()
+    }
 }

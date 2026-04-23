@@ -81,6 +81,8 @@ pub fn VMsPage() -> impl IntoView {
     let (f_cpu,       set_f_cpu)       = signal(1i32);
     let (f_memory,    set_f_memory)    = signal(1024i32);
     let (f_os_type,   set_f_os_type)   = signal(String::from("linux"));
+    let (f_disk_size, set_f_disk_size) = signal(20i32);
+    let (f_boot_device, set_f_boot_device) = signal(String::from("disk"));
 
     // Server actions
     let create_action = ServerAction::<CreateVM>::new();
@@ -89,14 +91,27 @@ pub fn VMsPage() -> impl IntoView {
     let power_action  = ServerAction::<ToggleVMPower>::new();
     let mount_action = ServerAction::<MountISO>::new();
     let unmount_action = ServerAction::<UnmountISO>::new();
+    let deploy_action = ServerAction::<DeployVM>::new();
+    let reboot_action = ServerAction::<RebootVM>::new();
+    let reset_action = ServerAction::<ResetVM>::new();
+    let resize_action = ServerAction::<ResizeVMDisk>::new();
+
+    let (show_resize_modal, set_show_resize_modal) = signal(Option::<VM>::None);
+    let (resize_val, set_resize_val) = signal(20i32);
+
+    // Dropdown state
+    let (open_manage_menu, set_open_manage_menu) = signal(Option::<String>::None);
 
     // Resource — refetches whenever any action version changes
     let vms_res = Resource::new(
         move || (
-            create_action.version().get(),
-            update_action.version().get(),
-            delete_action.version().get(),
             power_action.version().get(),
+            mount_action.version().get(),
+            unmount_action.version().get(),
+            deploy_action.version().get(),
+            reboot_action.version().get(),
+            reset_action.version().get(),
+            resize_action.version().get(),
         ),
         |_| async { list_vms().await },
     );
@@ -132,6 +147,8 @@ pub fn VMsPage() -> impl IntoView {
         set_f_cpu.set(1);
         set_f_memory.set(1024);
         set_f_os_type.set(String::from("linux"));
+        set_f_disk_size.set(20);
+        set_f_boot_device.set(String::from("disk"));
     };
 
     // Form submit
@@ -144,7 +161,9 @@ pub fn VMsPage() -> impl IntoView {
                 name: f_name.get_untracked(),
                 cpu: f_cpu.get_untracked(),
                 memory_mb: f_memory.get_untracked(),
+                disk_size_gb: f_disk_size.get_untracked(),
                 os_type: f_os_type.get_untracked(),
+                boot_device: f_boot_device.get_untracked(),
             });
         } else {
             create_action.dispatch(CreateVM {
@@ -152,7 +171,9 @@ pub fn VMsPage() -> impl IntoView {
                 name: f_name.get_untracked(),
                 cpu: f_cpu.get_untracked(),
                 memory_mb: f_memory.get_untracked(),
+                disk_size_gb: f_disk_size.get_untracked(),
                 os_type: f_os_type.get_untracked(),
+                boot_device: f_boot_device.get_untracked(),
             });
         }
         do_close();
@@ -224,7 +245,12 @@ pub fn VMsPage() -> impl IntoView {
                             }.into_any()
                         } else {
                             view! {
-                                <div class="overflow-x-auto">
+                        <div 
+                            class="overflow-x-auto"
+                            on:click=move |_| {
+                                set_open_manage_menu.set(None);
+                            }
+                        >
                                     <table class="w-full">
                                         <thead>
                                             <tr class="border-b border-gray-800 bg-gray-900/80">
@@ -238,10 +264,6 @@ pub fn VMsPage() -> impl IntoView {
                                         </thead>
                                         <tbody class="divide-y divide-gray-800/60">
                                             {vms.into_iter().map(|vm| {
-                                                let vm_iso = vm.clone();
-                                                let vm_edit = vm.clone();
-                                                let id_pwr = vm.id.clone();
-                                                let id_del = vm.id.clone();
                                                 let is_running = vm.status == "running";
                                                 
                                                 view! {
@@ -262,6 +284,7 @@ pub fn VMsPage() -> impl IntoView {
                                                             <div class="flex flex-col gap-0.5">
                                                                  <span>{format!("{} vCPU", vm.cpu)}</span>
                                                                  <span class="text-xs text-gray-500">{format!("{:.1} GB RAM", vm.memory_mb as f64 / 1024.0)}</span>
+                                                                 <span class="text-xs text-gray-500">{format!("{} GB Disk", vm.disk_size_gb)}</span>
                                                                  {vm.iso_volume_id.as_ref().map(|iso| view! {
                                                                      <span class="text-[10px] text-blue-400 font-mono mt-1 flex items-center gap-1">"💿 " {iso.clone()}</span>
                                                                  })}
@@ -272,73 +295,188 @@ pub fn VMsPage() -> impl IntoView {
                                                             <StatusBadge status=vm.status.clone()/>
                                                         </td>
                                                         <td class="px-6 py-4">
-                                                         <div class="flex items-center justify-end gap-2">
-                                                                // Power Toggle
+                                                            <div class="flex items-center justify-end gap-1.5">
+                                                                // Primary Action: Deploy or Power Toggle
+                                                                {if vm.disk_volume_id.is_none() {
+                                                                    let id_deploy = vm.id.clone();
+                                                                    view! {
+                                                                        <button
+                                                                            on:click=move |_| { deploy_action.dispatch(DeployVM { id: id_deploy.clone() }); }
+                                                                            disabled=is_viewer
+                                                                            class=move || format!("p-2 rounded-lg transition-all text-indigo-400 hover:bg-indigo-400/10 border border-transparent hover:border-indigo-400/20 {}", 
+                                                                                if is_viewer() { "opacity-30 grayscale cursor-not-allowed" } else { "cursor-pointer" }
+                                                                            )
+                                                                            title="Deploy VM"
+                                                                        >
+                                                                            <span class="text-lg">"🚀"</span>
+                                                                        </button>
+                                                                    }.into_any()
+                                                                } else {
+                                                                    let id_pwr = vm.id.clone();
+                                                                    view! {
+                                                                        <button
+                                                                            on:click={
+                                                                                let id = id_pwr.clone();
+                                                                                move |_| { power_action.dispatch(ToggleVMPower { id: id.clone() }); }
+                                                                            }
+                                                                            disabled=is_viewer
+                                                                            class=move || format!("p-2 rounded-lg transition-all border border-transparent {} {}", 
+                                                                                if is_running { "text-red-400 hover:bg-red-400/10 hover:border-red-400/20" } else { "text-green-400 hover:bg-green-400/10 hover:border-green-400/20" },
+                                                                                if is_viewer() { "opacity-30 grayscale cursor-not-allowed" } else { "cursor-pointer" }
+                                                                            )
+                                                                            title=if is_running { "Stop" } else { "Start" }
+                                                                        >
+                                                                            <span class="text-base">{if is_running { "■" } else { "▶" }}</span>
+                                                                        </button>
+                                                                    }.into_any()
+                                                                }}
+                                                                
+                                                                // Console Button
                                                                 <button
                                                                     on:click={
-                                                                        let id = id_pwr.clone();
-                                                                        move |_| { power_action.dispatch(ToggleVMPower { id: id.clone() }); }
+                                                                        let id = vm.id.clone();
+                                                                        move |_| {
+                                                                            let id_c = id.clone();
+                                                                            leptos::task::spawn_local(async move {
+                                                                                if let Ok(url) = get_vm_console(id_c).await {
+                                                                                    let _ = window().open_with_url_and_target(&url, "_blank");
+                                                                                }
+                                                                            });
+                                                                        }
                                                                     }
-                                                                    disabled=is_viewer
-                                                                    class=move || format!("p-2 rounded-md transition-colors {} {}", 
-                                                                        if is_running { "text-red-400 hover:bg-red-400/10" } else { "text-green-400 hover:bg-green-400/10" },
-                                                                        if is_viewer() { "opacity-30 grayscale cursor-not-allowed" } else { "cursor-pointer" }
-                                                                    )
-                                                                    title=if is_running { "Stop" } else { "Start" }
+                                                                    class="p-2 text-blue-400 hover:bg-blue-400/10 border border-transparent hover:border-blue-400/20 rounded-lg transition-all"
+                                                                    title="Open Console"
                                                                 >
-                                                                    {if is_running { "■" } else { "▶" }}
+                                                                    <span class="text-lg">"📺"</span>
                                                                 </button>
-                                                                
-                                                                 // Console
-                                                                 <button
-                                                                     on:click=move |_| {
-                                                                         let id = id_pwr.clone();
-                                                                         leptos::task::spawn_local(async move {
-                                                                            if let Ok(url) = get_vm_console(id).await {
-                                                                                let _ = window().open_with_url_and_target(&url, "_blank");
-                                                                            }
-                                                                         });
-                                                                     }
-                                                                     class="p-2 text-blue-400 hover:text-blue-300 hover:bg-blue-400/10 rounded-md transition-colors"
-                                                                     title="Open Console"
-                                                                 >
-                                                                     "📺"
-                                                                 </button>
 
-                                                                 // ISO
-                                                                 <button
-                                                                     on:click=move |_| { set_show_iso_modal.set(Some(vm_iso.clone())); }
-                                                                     class="p-2 text-cyan-400 hover:text-cyan-300 hover:bg-cyan-400/10 rounded-md transition-colors"
-                                                                     title="Manage ISO"
-                                                                 >
-                                                                     "💿"
-                                                                 </button>
-                                                                 
-                                                                 // Edit
+                                                                // Resize Button
                                                                 <button
-                                                                    on:click=move |_| {
-                                                                        set_f_name.set(vm_edit.name.clone());
-                                                                        set_f_host_id.set(vm_edit.host_id.clone());
-                                                                        set_f_cpu.set(vm_edit.cpu);
-                                                                        set_f_memory.set(vm_edit.memory_mb);
-                                                                        set_f_os_type.set(vm_edit.os_type.clone());
-                                                                        set_editing_vm.set(Some(vm_edit.clone()));
-                                                                        set_show_modal.set(true);
+                                                                    on:click={
+                                                                        let vm_res = vm.clone();
+                                                                        move |_| { 
+                                                                            set_resize_val.set(vm_res.disk_size_gb);
+                                                                            set_show_resize_modal.set(Some(vm_res.clone())); 
+                                                                        }
                                                                     }
                                                                     disabled=is_viewer
-                                                                    class=move || format!("p-2 text-gray-400 hover:text-white hover:bg-gray-800 rounded-md transition-colors {}",
+                                                                    class=move || format!("p-2 text-yellow-400 hover:bg-yellow-400/10 border border-transparent hover:border-yellow-400/20 rounded-lg transition-all {}",
                                                                         if is_viewer() { "opacity-30 grayscale cursor-not-allowed" } else { "cursor-pointer" }
                                                                     )
-                                                                >"✎"</button>
-                                                                
-                                                                // Delete
-                                                                <button
-                                                                    on:click=move |_| set_confirm_delete_id.set(Some(id_del.clone()))
-                                                                    disabled=is_viewer
-                                                                    class=move || format!("p-2 text-gray-500 hover:text-red-400 hover:bg-red-400/10 rounded-md transition-colors {}",
-                                                                        if is_viewer() { "opacity-30 grayscale cursor-not-allowed" } else { "cursor-pointer" }
-                                                                    )
-                                                                >"🗑"</button>
+                                                                    title="Resize Disk"
+                                                                >
+                                                                    <span class="text-lg">"📐"</span>
+                                                                </button>
+
+                                                                // Consolidated Operations Menu
+                                                                <div class="relative">
+                                                                    <button
+                                                                        on:click={
+                                                                            let id = vm.id.clone();
+                                                                            move |ev| {
+                                                                                ev.stop_propagation();
+                                                                                set_open_manage_menu.update(|v| {
+                                                                                    if v.as_ref() == Some(&id) { *v = None; } 
+                                                                                    else { *v = Some(id.clone()); }
+                                                                                });
+                                                                            }
+                                                                        }
+                                                                        disabled=is_viewer
+                                                                        class=move || format!("p-2 text-gray-400 hover:bg-gray-800 border border-transparent hover:border-gray-700 rounded-lg transition-all flex items-center gap-1 {}",
+                                                                            if is_viewer() { "opacity-30 grayscale cursor-not-allowed" } else { "cursor-pointer" }
+                                                                        )
+                                                                        title="Operations"
+                                                                    >
+                                                                        <span class="text-lg">"⌥"</span>
+                                                                        <span class="text-[8px] opacity-50">"▼"</span>
+                                                                    </button>
+                                                                    
+                                                                    {
+                                                                        let vm_id = vm.id.clone();
+                                                                        let id_reboot = vm.id.clone();
+                                                                        let id_reset = vm.id.clone();
+                                                                        let vm_iso = vm.clone();
+                                                                        let vm_edit = vm.clone();
+                                                                        let id_del = vm.id.clone();
+                                                                        
+                                                                        move || (open_manage_menu.get() == Some(vm_id.clone())).then({
+                                                                            let id_reboot = id_reboot.clone();
+                                                                            let id_reset = id_reset.clone();
+                                                                            let vm_iso = vm_iso.clone();
+                                                                            let vm_edit = vm_edit.clone();
+                                                                            let id_del = id_del.clone();
+                                                                            move || view! {
+                                                                                <div class="absolute right-0 mt-2 w-48 bg-gray-900 border border-gray-700 rounded-xl shadow-2xl z-50 overflow-hidden py-1">
+                                                                                    {if is_running {
+                                                                                        view! {
+                                                                                            <>
+                                                                                                <button 
+                                                                                                    on:click={
+                                                                                                        let id = id_reboot.clone();
+                                                                                                        move |_| { reboot_action.dispatch(RebootVM { id: id.clone() }); set_open_manage_menu.set(None); }
+                                                                                                    }
+                                                                                                    class="w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-800 hover:text-white flex items-center gap-2"
+                                                                                                >
+                                                                                                    <span>"⟳"</span> "Soft Reboot"
+                                                                                                </button>
+                                                                                                <button 
+                                                                                                    on:click={
+                                                                                                        let id = id_reset.clone();
+                                                                                                        move |_| { reset_action.dispatch(ResetVM { id: id.clone() }); set_open_manage_menu.set(None); }
+                                                                                                    }
+                                                                                                    class="w-full text-left px-4 py-2 text-xs text-orange-400 hover:bg-orange-950/30 hover:text-orange-300 flex items-center gap-2"
+                                                                                                >
+                                                                                                    <span>"⚡"</span> "Hard Reset"
+                                                                                                </button>
+                                                                                                <div class="h-px bg-gray-800 my-1"></div>
+                                                                                            </>
+                                                                                        }.into_any()
+                                                                                    } else {
+                                                                                        view! { <></> }.into_any()
+                                                                                    }}
+                                                                                    
+                                                                                    <button 
+                                                                                        on:click={
+                                                                                            let vm = vm_iso.clone();
+                                                                                            move |_| { set_show_iso_modal.set(Some(vm.clone())); set_open_manage_menu.set(None); }
+                                                                                        }
+                                                                                        class="w-full text-left px-4 py-2 text-xs text-cyan-400 hover:bg-cyan-950/20 hover:text-cyan-300 flex items-center gap-2"
+                                                                                    >
+                                                                                        <span>"💿"</span> "Attach/Detach ISO"
+                                                                                    </button>
+                                                                                    <button 
+                                                                                        on:click={
+                                                                                            let vm = vm_edit.clone();
+                                                                                            move |_| {
+                                                                                                set_f_name.set(vm.name.clone());
+                                                                                                set_f_host_id.set(vm.host_id.clone());
+                                                                                                set_f_cpu.set(vm.cpu);
+                                                                                                set_f_memory.set(vm.memory_mb);
+                                                                                                set_f_os_type.set(vm.os_type.clone());
+                                                                                                set_editing_vm.set(Some(vm.clone()));
+                                                                                                set_show_modal.set(true);
+                                                                                                set_open_manage_menu.set(None);
+                                                                                            }
+                                                                                        }
+                                                                                        class="w-full text-left px-4 py-2 text-xs text-gray-300 hover:bg-gray-800 hover:text-white flex items-center gap-2"
+                                                                                    >
+                                                                                        <span>"✎"</span> "Edit Configuration"
+                                                                                    </button>
+                                                                                    <div class="h-px bg-gray-800 my-1"></div>
+                                                                                    <button 
+                                                                                        on:click={
+                                                                                            let id = id_del.clone();
+                                                                                            move |_| { set_confirm_delete_id.set(Some(id.clone())); set_open_manage_menu.set(None); }
+                                                                                        }
+                                                                                        class="w-full text-left px-4 py-2 text-xs text-red-500 hover:bg-red-950/30 hover:text-red-400 flex items-center gap-2"
+                                                                                    >
+                                                                                        <span>"🗑"</span> "Destroy VM"
+                                                                                    </button>
+                                                                                </div>
+                                                                            }
+                                                                        })
+                                                                    }
+                                                                </div>
                                                             </div>
                                                         </td>
                                                     </tr>
@@ -423,6 +561,31 @@ pub fn VMsPage() -> impl IntoView {
                                             }
                                         }
                                     />
+                                </div>
+                            </div>
+
+                            // Resource Configuration continued
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class=label_cls()>"Disk Size (GB)"</label>
+                                    <input type="number" min="1" max="10000" required
+                                        class=input_cls()
+                                        prop:value=move || f_disk_size.get().to_string()
+                                        on:input=move |ev| {
+                                            if let Ok(val) = event_target_value(&ev).parse::<i32>() {
+                                                set_f_disk_size.set(val);
+                                            }
+                                        }
+                                    />
+                                </div>
+                                <div>
+                                    <label class=label_cls()>"Boot Priority"</label>
+                                    <select class=input_cls() required
+                                        on:change=move |ev| set_f_boot_device.set(event_target_value(&ev))
+                                    >
+                                        <option value="disk" selected=move || f_boot_device.get() == "disk">"Disk"</option>
+                                        <option value="cdrom" selected=move || f_boot_device.get() == "cdrom">"ISO (CDROM)"</option>
+                                    </select>
                                 </div>
                             </div>
 
@@ -577,6 +740,70 @@ pub fn VMsPage() -> impl IntoView {
                     </div>
                 }
             })}
+
+            // ── Resize Modal ────────────────────────────────────────────────
+             {move || show_resize_modal.get().map(|vm| {
+                let id = vm.id.clone();
+                let vm_name = vm.name.clone();
+                let current_size = vm.disk_size_gb;
+                
+                view! {
+                    <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+                        <div class="absolute inset-0 bg-black/70 backdrop-blur-sm" on:click=move |_| set_show_resize_modal.set(None)/>
+                        <div class="relative bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden">
+                            <div class="flex items-center justify-between px-6 py-5 border-b border-gray-800">
+                                <h2 class="text-base font-bold text-white tracking-tight">{format!("Resize Disk: {}", vm_name)}</h2>
+                                <button on:click=move |_| set_show_resize_modal.set(None)
+                                    class="text-gray-500 hover:text-white text-2xl leading-none">"×"</button>
+                            </div>
+                            
+                            <div class="p-6 space-y-4">
+                                <div class="bg-yellow-500/5 border border-yellow-500/20 rounded-lg p-3">
+                                    <p class="text-xs text-yellow-300 font-semibold uppercase tracking-wider mb-1">"Current Size"</p>
+                                    <p class="text-sm text-white font-bold">{current_size} " GB"</p>
+                                </div>
+
+                                <div>
+                                    <label class=label_cls()>"New Size (GB)"</label>
+                                    <input type="number" min=current_size max="10000"
+                                        class=input_cls()
+                                        prop:value=move || resize_val.get().to_string()
+                                        on:input=move |ev| {
+                                            if let Ok(val) = event_target_value(&ev).parse::<i32>() {
+                                                set_resize_val.set(val);
+                                            }
+                                        }
+                                    />
+                                    <p class="text-[10px] text-gray-500 mt-1.5 italic">
+                                        "Note: Disk expansion is generally safe, but shrinking is not supported by Linstor."
+                                    </p>
+                                </div>
+
+                                <div class="flex justify-end gap-3 pt-4 border-t border-gray-800">
+                                    <button on:click=move |_| set_show_resize_modal.set(None)
+                                        class="px-4 py-2 text-sm text-gray-400 hover:text-white transition-colors">
+                                        "Cancel"
+                                    </button>
+                                    <button 
+                                        on:click={
+                                            let id = id.clone();
+                                            move |_| {
+                                                let id = id.clone();
+                                                let size = resize_val.get_untracked();
+                                                resize_action.dispatch(ResizeVMDisk { id, new_size_gb: size });
+                                                set_show_resize_modal.set(None);
+                                            }
+                                        }
+                                        class="px-6 py-2 bg-yellow-600 hover:bg-yellow-500 text-white text-sm font-semibold rounded-lg transition-all"
+                                    >
+                                        "RESIZE NOW"
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                }.into_any()
+             })}
 
             // ── Delete Confirm Modal ──
             {move || confirm_delete_id.get().map(|del_id| {
